@@ -1,0 +1,3137 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import StateGraph, START, END
+
+logger = logging.getLogger(__name__)
+
+# Supports the invoice formats required by the capstone.
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".png"}
+
+DEFAULT_INCOMING_DIR = Path("backend/data/incoming")
+LOCAL_AUDIT_FILE = Path("backend/data/processed_files.json")
+
+
+class InvoiceMonitorState(TypedDict, total=False):
+    incoming_dir: str
+    discovered_files: list[dict[str, Any]]
+    new_invoices: list[dict[str, Any]]
+    skipped_invoices: list[dict[str, Any]]
+    errors: list[dict[str, Any]]
+    scan_summary: dict[str, int]
+
+
+def calculate_sha256(file_path: Path) -> str:
+    """Calculate the SHA-256 checksum without loading the entire file."""
+    sha256 = hashlib.sha256()
+
+    with file_path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            sha256.update(chunk)
+
+    return sha256.hexdigest()
+
+
+def load_local_audit() -> dict[str, Any]:
+    """Load the local audit fallback when PostgreSQL is not configured."""
+    if not LOCAL_AUDIT_FILE.exists():
+        return {"files": []}
+
+    try:
+        return json.loads(LOCAL_AUDIT_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.exception("Could not read local audit file")
+        return {"files": []}
+
+
+def save_local_audit(audit: dict[str, Any]) -> None:
+    """Persist local monitoring records for development."""
+    LOCAL_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_file = LOCAL_AUDIT_FILE.with_suffix(".tmp")
+    temporary_file.write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary_file.replace(LOCAL_AUDIT_FILE)
+
+
+def find_existing_invoice(checksum: str) -> str | None:
+    """
+    Return an existing invoice ID if its checksum is already audited.
+
+    Uses PostgreSQL when DATABASE_URL is configured.
+    Otherwise, uses a local JSON audit file for development.
+    """
+    database_url = os.getenv("DATABASE_URL")
+
+    if database_url:
+        import psycopg
+
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT invoice_id
+                    FROM audit.invoice_audit
+                    WHERE file_checksum = %s
+                    LIMIT 1
+                    """,
+                    (checksum,),
+                )
+                row = cursor.fetchone()
+
+                return str(row[0]) if row else None
+
+    audit = load_local_audit()
+
+    for record in audit["files"]:
+        if record.get("file_checksum") == checksum:
+            return record.get("invoice_id", "already-processed")
+
+    return None
+
+
+def scan_inbox(state: InvoiceMonitorState) -> dict[str, Any]:
+    """Discover invoice files and identify duplicates."""
+    incoming_dir = Path(
+        state.get("incoming_dir") or DEFAULT_INCOMING_DIR
+    ).resolve()
+
+    discovered_files: list[dict[str, Any]] = []
+    errors = list(state.get("errors", []))
+
+    if not incoming_dir.exists():
+        return {
+            "discovered_files": [],
+            "errors": errors + [{
+                "file_path": str(incoming_dir),
+                "stage": "scan_inbox",
+                "error": "Incoming directory does not exist",
+            }],
+        }
+
+    if not incoming_dir.is_dir():
+        return {
+            "discovered_files": [],
+            "errors": errors + [{
+                "file_path": str(incoming_dir),
+                "stage": "scan_inbox",
+                "error": "Incoming path is not a directory",
+            }],
+        }
+
+    for file_path in sorted(incoming_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+
+        # Ignore temporary files and the local audit file.
+        if file_path.name.startswith("~$"):
+            continue
+
+        record: dict[str, Any] = {
+            "invoice_id": str(uuid.uuid4()),
+            "file_path": str(file_path),
+            "file_name": file_path.name,
+            "file_type": file_path.suffix.lower(),
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "file_checksum": None,
+            "status": "detected",
+            "error": None,
+        }
+
+        try:
+            record["file_checksum"] = calculate_sha256(file_path)
+
+            if record["file_type"] not in SUPPORTED_EXTENSIONS:
+                record["status"] = "unsupported"
+                record["error"] = (
+                    f"Unsupported file type: {record['file_type']}"
+                )
+
+            else:
+                existing_id = find_existing_invoice(
+                    record["file_checksum"]
+                )
+
+                if existing_id:
+                    record["status"] = "duplicate"
+                    record["existing_invoice_id"] = existing_id
+
+        except Exception as exc:
+            logger.exception("Failed to inspect file: %s", file_path)
+            record["status"] = "failed"
+            record["error"] = str(exc)
+
+            errors.append({
+                "file_path": str(file_path),
+                "stage": "scan_inbox",
+                "error": str(exc),
+            })
+
+        discovered_files.append(record)
+
+    return {
+        "discovered_files": discovered_files,
+        "errors": errors,
+    }
+
+
+def evaluate_results(
+    state: InvoiceMonitorState,
+) -> dict[str, Any]:
+    """Separate new invoices, duplicates, and files requiring attention."""
+    new_invoices = []
+    skipped_invoices = []
+    errors = list(state.get("errors", []))
+
+    for record in state.get("discovered_files", []):
+        status = record["status"]
+
+        if status == "detected":
+            new_invoices.append(record)
+
+        elif status in {"duplicate", "unsupported"}:
+            skipped_invoices.append(record)
+
+            if status == "unsupported":
+                errors.append({
+                    "file_path": record["file_path"],
+                    "stage": "evaluate_results",
+                    "error": record["error"],
+                })
+
+        elif status == "failed":
+            errors.append({
+                "file_path": record["file_path"],
+                "stage": "evaluate_results",
+                "error": record["error"],
+            })
+
+    return {
+        "new_invoices": new_invoices,
+        "skipped_invoices": skipped_invoices,
+        "errors": errors,
+    }
+
+
+def record_detection(record: dict[str, Any]) -> None:
+    """
+    Record each non-duplicate detection.
+
+    PostgreSQL is the preferred audit store. The JSON fallback is for
+    local development only; it is not a replacement for durable storage.
+    """
+    database_url = os.getenv("DATABASE_URL")
+
+    # A duplicate already has an audit row. Never insert it again.
+    if record["status"] == "duplicate":
+        return
+
+    validation_status = (
+        "pending" if record["status"] == "detected" else "failed"
+    )
+
+    metadata = {
+        "file_name": record["file_name"],
+        "file_type": record["file_type"],
+        "monitor_status": record["status"],
+        "monitor_error": record.get("error"),
+        "detected_at": record["detected_at"],
+    }
+
+    if database_url:
+        import psycopg
+
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO audit.invoice_audit (
+                        invoice_id,
+                        file_path,
+                        file_checksum,
+                        validation_status,
+                        extracted_raw,
+                        processed_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s::jsonb, NOW()
+                    )
+                    ON CONFLICT (file_checksum) DO NOTHING
+                    """,
+                    (
+                        record["invoice_id"],
+                        record["file_path"],
+                        record["file_checksum"],
+                        validation_status,
+                        json.dumps(metadata),
+                    ),
+                )
+        return
+
+    audit = load_local_audit()
+    audit["files"].append({
+        **record,
+        "validation_status": validation_status,
+    })
+    save_local_audit(audit)
+
+
+def mark_processed(
+    state: InvoiceMonitorState,
+) -> dict[str, Any]:
+    """Persist detection records and return the monitor summary."""
+    errors = list(state.get("errors", []))
+
+    records_to_save = [
+        record
+        for record in state.get("discovered_files", [])
+        if record["status"] != "duplicate"
+    ]
+
+    for record in records_to_save:
+        try:
+            record_detection(record)
+        except Exception as exc:
+            logger.exception(
+                "Could not persist detection for %s",
+                record["file_path"],
+            )
+            errors.append({
+                "file_path": record["file_path"],
+                "stage": "mark_processed",
+                "error": str(exc),
+            })
+
+    discovered = state.get("discovered_files", [])
+    new_invoices = state.get("new_invoices", [])
+    skipped = state.get("skipped_invoices", [])
+
+    return {
+        "errors": errors,
+        "scan_summary": {
+            "total_files": len(discovered),
+            "new_invoices": len(new_invoices),
+            "skipped_files": len(skipped),
+            "failed_files": sum(
+                record["status"] == "failed"
+                for record in discovered
+            ),
+        },
+    }
+
+
+def build_invoice_monitor_graph():
+    """Build the monitor agent using the GitHub-style LangGraph flow."""
+    graph = StateGraph(InvoiceMonitorState)
+
+    graph.add_node("scan_inbox", scan_inbox)
+    graph.add_node("evaluate_results", evaluate_results)
+    graph.add_node("mark_processed", mark_processed)
+
+    graph.add_edge(START, "scan_inbox")
+    graph.add_edge("scan_inbox", "evaluate_results")
+    graph.add_edge("evaluate_results", "mark_processed")
+    graph.add_edge("mark_processed", END)
+
+    return graph.compile()
+
+
+invoice_monitor_agent = build_invoice_monitor_graph()
+
+
+def run_invoice_monitor(
+    incoming_dir: str | None = None,
+) -> dict[str, Any]:
+    """Run the invoice monitor and return its LangGraph state."""
+    initial_state: InvoiceMonitorState = {
+        "incoming_dir": incoming_dir or str(DEFAULT_INCOMING_DIR),
+        "discovered_files": [],
+        "new_invoices": [],
+        "skipped_invoices": [],
+        "errors": [],
+        "scan_summary": {},
+    }
+
+    return invoice_monitor_agent.invoke(initial_state)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    result = run_invoice_monitor()
+
+    print(json.dumps({
+        "summary": result.get("scan_summary", {}),
+        "new_invoices": result.get("new_invoices", []),
+        "skipped_invoices": result.get("skipped_invoices", []),
+        "errors": result.get("errors", []),
+    }, indent=2))
+
+
+pip install langgraph "psycopg[binary]"
+
+python -m backend.agents.invoice_monitor_agent
+
+
+
+
+
+
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import uuid
+
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import StateGraph, START, END
+
+logger = logging.getLogger(__name__)
+
+
+class ExtractorState(TypedDict, total=False):
+    new_invoices: list[dict[str, Any]]
+    extracted_invoices: list[dict[str, Any]]
+    extraction_errors: list[dict[str, Any]]
+
+
+def extract_pdf(file_path: Path) -> tuple[str, str]:
+    """Extract PDF text, falling back to OCR for scanned PDFs."""
+    import pdfplumber
+
+    text_parts = []
+
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text_parts.append(page.extract_text() or "")
+
+    text = "\n".join(text_parts).strip()
+
+    if text:
+        return text, "pdfplumber"
+
+    # OCR fallback for scanned PDFs.
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    images = convert_from_path(str(file_path))
+    ocr_text = "\n".join(
+        pytesseract.image_to_string(image)
+        for image in images
+    ).strip()
+
+    if not ocr_text:
+        raise ValueError("No text could be extracted from the PDF.")
+
+    return ocr_text, "tesseract"
+
+
+def extract_docx(file_path: Path) -> tuple[str, str]:
+    """Extract paragraphs and table content from a DOCX file."""
+    from docx import Document
+
+    document = Document(str(file_path))
+    parts = []
+
+    for paragraph in document.paragraphs:
+        if paragraph.text.strip():
+            parts.append(paragraph.text.strip())
+
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+
+    text = "\n".join(parts).strip()
+
+    if not text:
+        raise ValueError("No text could be extracted from the DOCX.")
+
+    return text, "python-docx"
+
+
+def extract_image(file_path: Path) -> tuple[str, str]:
+    """Extract text from a PNG image using Tesseract OCR."""
+    from PIL import Image
+    import pytesseract
+
+    with Image.open(file_path) as image:
+        text = pytesseract.image_to_string(image).strip()
+
+    if not text:
+        raise ValueError("No text could be extracted from the image.")
+
+    return text, "tesseract"
+
+
+def extract_document(file_path: Path) -> tuple[str, str]:
+    """Route extraction according to the file extension."""
+    extension = file_path.suffix.lower()
+
+    if extension == ".pdf":
+        return extract_pdf(file_path)
+
+    if extension == ".docx":
+        return extract_docx(file_path)
+
+    if extension == ".png":
+        return extract_image(file_path)
+
+    raise ValueError(f"Unsupported file type: {extension}")
+
+
+def find_first(pattern: str, text: str) -> str | None:
+    """Return the first regex capture, if available."""
+    match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def parse_invoice_fields(text: str) -> dict[str, Any]:
+    """
+    Extract common invoice fields using transparent regex rules.
+
+    These are initial heuristics. Vendor-specific layouts may require
+    additional patterns or an LLM-based structured extraction step.
+    """
+    invoice_number = find_first(
+        r"(?:invoice\s*(?:number|no\.?|#|id))\s*[:#\-]?\s*([A-Z0-9\-\/]+)",
+        text,
+    )
+
+    invoice_date = find_first(
+        r"(?:invoice\s*date|date)\s*[:#\-]?\s*"
+        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+        text,
+    )
+
+    vendor_name = find_first(
+        r"(?:vendor|supplier|seller)\s*(?:name)?\s*[:\-]\s*(.+)",
+        text,
+    )
+
+    po_number = find_first(
+        r"(?:purchase\s*order|PO)\s*(?:number|no\.?|#)?\s*[:#\-]?\s*([A-Z0-9\-\/]+)",
+        text,
+    )
+
+    currency = find_first(
+        r"\b(USD|INR|EUR|GBP|AUD|CAD|JPY|CNY)\b",
+        text,
+    )
+
+    total_amount = find_first(
+        r"(?:grand\s*total|invoice\s*total|total\s*amount|amount\s*due|total)"
+        r"\s*[:\-]?\s*(?:INR|USD|EUR|GBP|₹|\$|€|£)?\s*"
+        r"([\d,]+(?:\.\d{1,2})?)",
+        text,
+    )
+
+    return {
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
+        "vendor_name": vendor_name,
+        "po_number": po_number,
+        "currency": currency,
+        "total_amount": (
+            total_amount.replace(",", "")
+            if total_amount
+            else None
+        ),
+    }
+
+
+def extract_all(state: ExtractorState) -> dict[str, Any]:
+    """Extract raw text and fields from every new invoice."""
+    extracted_invoices = []
+    extraction_errors = list(state.get("extraction_errors", []))
+
+    for invoice in state.get("new_invoices", []):
+        file_path = Path(invoice["file_path"])
+
+        try:
+            raw_text, extraction_method = extract_document(file_path)
+            fields = parse_invoice_fields(raw_text)
+
+            extracted_invoices.append({
+                **invoice,
+                "invoice_id": invoice.get("invoice_id", str(uuid.uuid4())),
+                "raw_extracted_text": raw_text,
+                "extraction_method": extraction_method,
+                "extracted_fields": fields,
+                "line_items": [],
+                "extraction_status": "completed",
+            })
+
+        except Exception as exc:
+            logger.exception("Extraction failed for %s", file_path)
+
+            extraction_errors.append({
+                "invoice_id": invoice.get("invoice_id"),
+                "file_path": str(file_path),
+                "stage": "extractor",
+                "error": str(exc),
+            })
+
+            extracted_invoices.append({
+                **invoice,
+                "raw_extracted_text": "",
+                "extraction_method": None,
+                "extracted_fields": {},
+                "line_items": [],
+                "extraction_status": "failed",
+                "extraction_error": str(exc),
+            })
+
+    return {
+        "extracted_invoices": extracted_invoices,
+        "extraction_errors": extraction_errors,
+    }
+
+
+def validate_extractions(state: ExtractorState) -> dict[str, Any]:
+    """Mark extracted records that need manual review."""
+    for invoice in state.get("extracted_invoices", []):
+        if invoice.get("extraction_status") != "completed":
+            continue
+
+        fields = invoice.get("extracted_fields", {})
+        missing_fields = [
+            field
+            for field in (
+                "invoice_number",
+                "invoice_date",
+                "vendor_name",
+                "currency",
+                "total_amount",
+            )
+            if not fields.get(field)
+        ]
+
+        invoice["missing_fields"] = missing_fields
+        invoice["extraction_status"] = (
+            "needs_review" if missing_fields else "completed"
+        )
+
+    return {"extracted_invoices": state.get("extracted_invoices", [])}
+
+
+def build_extractor_graph():
+    graph = StateGraph(ExtractorState)
+
+    graph.add_node("extract_all", extract_all)
+    graph.add_node("validate_extractions", validate_extractions)
+
+    graph.add_edge(START, "extract_all")
+    graph.add_edge("extract_all", "validate_extractions")
+    graph.add_edge("validate_extractions", END)
+
+    return graph.compile()
+
+
+extractor_agent = build_extractor_graph()
+
+
+def run_extractor(
+    new_invoices: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run the extraction workflow for monitor-discovered invoices."""
+    return extractor_agent.invoke({
+        "new_invoices": new_invoices,
+        "extracted_invoices": [],
+        "extraction_errors": [],
+    })
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    # Example: use files discovered by the invoice monitor.
+    from backend.agents.invoice_monitor_agent import run_invoice_monitor
+
+    monitor_result = run_invoice_monitor()
+    result = run_extractor(monitor_result.get("new_invoices", []))
+
+    print(json.dumps({
+        "extracted_invoices": result.get("extracted_invoices", []),
+        "extraction_errors": result.get("extraction_errors", []),
+    }, indent=2, ensure_ascii=False))
+
+
+test_extractor.py:
+
+import json
+from pathlib import Path
+
+from backend.agents.extractor_agent import run_extractor
+
+# Put a real PDF, DOCX, or PNG invoice here.
+invoice_path = Path("backend/data/incoming/invoice1.pdf")
+
+if not invoice_path.exists():
+    raise FileNotFoundError(
+        f"Invoice not found: {invoice_path.resolve()}"
+    )
+
+test_invoice = {
+    "invoice_id": "test-invoice-001",
+    "file_path": str(invoice_path.resolve()),
+    "file_name": invoice_path.name,
+    "file_type": invoice_path.suffix.lower(),
+    "file_checksum": "test-checksum",
+    "status": "detected",
+}
+
+result = run_extractor([test_invoice])
+
+print(json.dumps({
+    "extracted_invoices": result.get("extracted_invoices", []),
+    "extraction_errors": result.get("extraction_errors", []),
+}, indent=2, ensure_ascii=False))
+
+
+python test_extractor.py
+
+
+
+
+
+"""
+Shared Amazon Bedrock configuration for AI Invoice Auditor.
+
+Uses Amazon Nova Lite through the Bedrock Converse API.
+Credentials are loaded through boto3's standard AWS credential chain.
+"""
+
+import os
+from typing import Optional
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+
+# ---------------------------------------------------------
+# Configuration: fill in your AWS details
+# ---------------------------------------------------------
+
+AWS_REGION = os.getenv(
+    "AWS_REGION",
+    "YOUR_AWS_REGION",
+)
+
+BEDROCK_MODEL_ID = os.getenv(
+    "BEDROCK_MODEL_ID",
+    "YOUR_NOVA_LITE_MODEL_ID",
+)
+
+# Keep these as environment variables or use an AWS profile/IAM role.
+# Do not hardcode AWS access keys or secret keys in this file.
+
+
+def get_bedrock_client():
+    """Create a Bedrock Runtime client."""
+    if not AWS_REGION or AWS_REGION == "YOUR_AWS_REGION":
+        raise ValueError(
+            "Set AWS_REGION in backend/services/amazon_bedrock.py "
+            "or configure the AWS_REGION environment variable."
+        )
+
+    return boto3.client(
+        service_name="bedrock-runtime",
+        region_name=AWS_REGION,
+    )
+
+
+def invoke_bedrock(
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 4000,
+    temperature: float = 0.0,
+) -> str:
+    """
+    Send a prompt to Amazon Nova Lite using the Converse API.
+
+    Returns:
+        The model's response text.
+
+    Raises:
+        ValueError: If configuration or response content is invalid.
+        ClientError/BotoCoreError: If AWS reports a request error.
+    """
+    if not prompt or not prompt.strip():
+        raise ValueError("The Bedrock prompt cannot be empty.")
+
+    if (
+        not BEDROCK_MODEL_ID
+        or BEDROCK_MODEL_ID == "YOUR_NOVA_LITE_MODEL_ID"
+    ):
+        raise ValueError(
+            "Set BEDROCK_MODEL_ID to your Amazon Nova Lite model ID."
+        )
+
+    client = get_bedrock_client()
+
+    request = {
+        "modelId": BEDROCK_MODEL_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": prompt}],
+            }
+        ],
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            "temperature": temperature,
+        },
+    }
+
+    if system_prompt and system_prompt.strip():
+        request["system"] = [{"text": system_prompt}]
+
+    response = client.converse(**request)
+
+    content_blocks = (
+        response.get("output", {})
+        .get("message", {})
+        .get("content", [])
+    )
+
+    response_text = "\n".join(
+        block["text"]
+        for block in content_blocks
+        if isinstance(block, dict) and "text" in block
+    ).strip()
+
+    if not response_text:
+        raise ValueError("Amazon Bedrock returned an empty response.")
+
+    return response_text
+
+
+
+
+"""
+Translation Agent - AI Invoice Auditor
+
+Responsibilities:
+1. Read extracted invoice text from the previous agent.
+2. Detect the source language.
+3. Translate non-English invoices into English using Amazon Bedrock.
+4. Preserve invoice numbers, dates, quantities, prices, tax values, and currencies.
+5. Cache translation results locally to avoid repeated Bedrock calls.
+6. Preserve the original invoice text.
+7. Record translation failures without stopping other invoices.
+8. Expose a LangGraph workflow.
+
+Expected input:
+{
+    "extracted_invoices": [
+        {
+            "file_path": "data/incoming/invoice.pdf",
+            "raw_extracted_text": "...",
+            "extracted_fields": {...}
+        }
+    ]
+}
+
+Output:
+{
+    "translated_invoices": [...],
+    "translation_errors": [...]
+}
+"""
+
+import hashlib
+import json
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from backend.services.amazon_bedrock import invoke_bedrock
+
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+CACHE_FILE = BASE_DIR / "data" / "cache" / "translations.json"
+
+CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------
+
+class TranslationState(TypedDict, total=False):
+    extracted_invoices: list[dict[str, Any]]
+    translated_invoices: list[dict[str, Any]]
+    translation_errors: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------
+
+def load_cache() -> dict[str, dict[str, Any]]:
+    """
+    Load translation cache from a local JSON file.
+    Returns an empty cache if the file does not exist
+    or contains invalid JSON.
+    """
+    if not CACHE_FILE.exists():
+        return {}
+
+    try:
+        with CACHE_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not load translation cache: %s", exc)
+        return {}
+
+
+def save_cache(cache: dict[str, dict[str, Any]]) -> None:
+    """
+    Save translation cache to disk.
+    """
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_file = CACHE_FILE.with_suffix(".tmp")
+
+    try:
+        with temporary_file.open("w", encoding="utf-8") as file:
+            json.dump(
+                cache,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        temporary_file.replace(CACHE_FILE)
+
+    except OSError:
+        logger.exception("Could not save translation cache")
+
+        try:
+            if temporary_file.exists():
+                temporary_file.unlink()
+        except OSError:
+            pass
+
+
+def make_cache_key(source_text: str) -> str:
+    """
+    Generate a deterministic cache key from the invoice text.
+
+    Include the configured model ID so cached results from
+    different models are not accidentally reused.
+    """
+    model_id = os.getenv(
+        "BEDROCK_MODEL_ID",
+        "YOUR_NOVA_LITE_MODEL_ID"
+    )
+
+    value = f"{model_id}\n{source_text}"
+
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+# ---------------------------------------------------------
+# Model response parsing
+# ---------------------------------------------------------
+
+def parse_model_json(response_text: str) -> dict[str, Any]:
+    """
+    Parse JSON returned by the language model.
+    Also supports responses surrounded by Markdown fences.
+    """
+    if not response_text or not response_text.strip():
+        raise ValueError("The model returned an empty response.")
+
+    cleaned = response_text.strip()
+
+    # Remove optional Markdown code fences.
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        result = json.loads(cleaned)
+
+    except json.JSONDecodeError:
+        # Try extracting the first JSON object.
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+
+        if not match:
+            raise ValueError(
+                "The model response did not contain valid JSON."
+            )
+
+        try:
+            result = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Could not parse JSON from the model response."
+            ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            "The model response must be a JSON object."
+        )
+
+    return result
+
+
+def normalize_confidence(value: Any) -> float | None:
+    """
+    Normalize a model-reported confidence value to the
+    range 0.0-1.0.
+
+    This is an estimate supplied by the model, not a
+    calibrated measurement of translation accuracy.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence /= 100.0
+
+    if not 0.0 <= confidence <= 1.0:
+        return None
+
+    return round(confidence, 4)
+
+
+# ---------------------------------------------------------
+# Translation prompt
+# ---------------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are a careful financial-document translation assistant.
+
+Translate invoice text accurately into English.
+
+Rules:
+1. Preserve invoice numbers, purchase order numbers, vendor IDs,
+   SKU codes, dates, quantities, unit prices, line totals,
+   tax amounts, invoice totals, and currency codes.
+2. Do not calculate, correct, or invent financial values.
+3. Do not remove line items, notes, payment terms, or tax details.
+4. Keep names, addresses, product codes, and company identifiers
+   unchanged unless a direct translation is necessary.
+5. Preserve the original meaning and document structure as much
+   as possible.
+6. If text is already English, return it unchanged.
+7. If the text is unreadable or ambiguous, explain that in
+   translation_notes instead of guessing.
+8. Return only a valid JSON object with the requested fields.
+9. The confidence value is your estimated confidence between
+   0 and 1, not a verified accuracy measurement.
+"""
+
+
+def build_translation_prompt(source_text: str) -> str:
+    """
+    Construct the translation request.
+    """
+    return f"""
+Identify the language of the following invoice text and
+translate the complete text into English.
+
+Return exactly one JSON object with these fields:
+
+{{
+  "source_language": "detected language name or code",
+  "translated_text": "complete English translation",
+  "translation_confidence": 0.0,
+  "translation_notes": "uncertainties or relevant notes"
+}}
+
+The translation_confidence must be a number between 0 and 1.
+
+Do not omit invoice sections. Do not change numerical values,
+currency codes, invoice identifiers, or dates.
+
+INVOICE TEXT START
+------------------
+{source_text}
+------------------
+INVOICE TEXT END
+"""
+
+
+# ---------------------------------------------------------
+# Core translation function
+# ---------------------------------------------------------
+
+def translate_text(source_text: str) -> dict[str, Any]:
+    """
+    Translate invoice text using the shared Amazon Bedrock
+    service and cache successful responses.
+
+    Returns:
+        source_language
+        translated_text
+        translation_confidence
+        translation_notes
+        cache_hit
+    """
+    if not isinstance(source_text, str) or not source_text.strip():
+        raise ValueError("Invoice text is empty; nothing to translate.")
+
+    source_text = source_text.strip()
+
+    cache = load_cache()
+    cache_key = make_cache_key(source_text)
+
+    # Return cached result if available.
+    cached_result = cache.get(cache_key)
+
+    if isinstance(cached_result, dict):
+        cached_result = dict(cached_result)
+        cached_result["cache_hit"] = True
+        return cached_result
+
+    prompt = build_translation_prompt(source_text)
+
+    # Calls backend/services/amazon_bedrock.py.
+    # AWS credentials and Bedrock model configuration are handled there.
+    response_text = invoke_bedrock(
+        prompt=prompt,
+        system_prompt=SYSTEM_PROMPT,
+        max_tokens=8000,
+        temperature=0.0
+    )
+
+    model_result = parse_model_json(response_text)
+
+    translated_text = model_result.get("translated_text")
+
+    if not isinstance(translated_text, str) or not translated_text.strip():
+        raise ValueError(
+            "The model did not return a valid translated_text field."
+        )
+
+    source_language = model_result.get("source_language", "unknown")
+
+    if not isinstance(source_language, str):
+        source_language = str(source_language)
+
+    translation_notes = model_result.get("translation_notes", "")
+
+    if not isinstance(translation_notes, str):
+        translation_notes = str(translation_notes)
+
+    result = {
+        "source_language": source_language.strip() or "unknown",
+        "translated_text": translated_text.strip(),
+        "translation_confidence": normalize_confidence(
+            model_result.get("translation_confidence")
+        ),
+        "translation_notes": translation_notes.strip(),
+        "cache_hit": False
+    }
+
+    # Cache only successfully parsed translations.
+    cache[cache_key] = dict(result)
+    save_cache(cache)
+
+    return result
+
+
+# ---------------------------------------------------------
+# Invoice text extraction from upstream state
+# ---------------------------------------------------------
+
+def get_invoice_text(invoice: dict[str, Any]) -> str:
+    """
+    Obtain raw text from the extraction agent's output.
+
+    Prefer the complete original extracted text. If it is
+    unavailable, use extracted_fields as a fallback.
+    """
+    possible_text_fields = (
+        "raw_extracted_text",
+        "raw_text",
+        "extracted_text"
+    )
+
+    for field in possible_text_fields:
+        value = invoice.get(field)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    extracted_fields = invoice.get("extracted_fields")
+
+    if isinstance(extracted_fields, dict) and extracted_fields:
+        return json.dumps(
+            extracted_fields,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    return ""
+
+
+# ---------------------------------------------------------
+# LangGraph node
+# ---------------------------------------------------------
+
+def translate_invoices(
+    state: TranslationState
+) -> dict[str, Any]:
+    """
+    Translate every invoice received from the extraction agent.
+
+    Individual failures are recorded in translation_errors,
+    allowing other invoices to continue.
+    """
+    extracted_invoices = state.get("extracted_invoices", [])
+
+    translated_invoices: list[dict[str, Any]] = []
+    translation_errors: list[dict[str, Any]] = []
+
+    if not isinstance(extracted_invoices, list):
+        return {
+            "translated_invoices": [],
+            "translation_errors": [
+                {
+                    "file_path": None,
+                    "error": (
+                        "extracted_invoices must be a list."
+                    )
+                }
+            ]
+        }
+
+    for invoice in extracted_invoices:
+        if not isinstance(invoice, dict):
+            translation_errors.append({
+                "file_path": None,
+                "error": "Invoice entry is not a dictionary."
+            })
+            continue
+
+        file_path = invoice.get("file_path")
+
+        if file_path is None:
+            file_path = invoice.get("source_file")
+
+        if file_path is None:
+            file_path = invoice.get("filename")
+
+        original_text = get_invoice_text(invoice)
+
+        if not original_text:
+            translation_errors.append({
+                "file_path": file_path,
+                "error": "No extracted text is available."
+            })
+
+            translated_invoices.append({
+                **invoice,
+                "original_text": "",
+                "translated_text": "",
+                "source_language": "unknown",
+                "translation_confidence": None,
+                "translation_notes": "No extracted text available.",
+                "translation_status": "failed",
+                "translation_error": "No extracted text is available."
+            })
+            continue
+
+        try:
+            translation_result = translate_text(original_text)
+
+            # Keep the upstream invoice fields and original text.
+            translated_invoice = {
+                **invoice,
+                "original_text": original_text,
+                "translated_text": translation_result["translated_text"],
+                "source_language": translation_result["source_language"],
+                "translation_confidence": (
+                    translation_result["translation_confidence"]
+                ),
+                "translation_notes": translation_result["translation_notes"],
+                "translation_cache_hit": translation_result["cache_hit"],
+                "translation_status": "success",
+                "translation_error": None
+            }
+
+            translated_invoices.append(translated_invoice)
+
+            logger.info(
+                "Translation completed for %s; source language=%s; cache_hit=%s",
+                file_path,
+                translation_result["source_language"],
+                translation_result["cache_hit"]
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Translation failed for invoice %s",
+                file_path
+            )
+
+            translation_errors.append({
+                "file_path": file_path,
+                "error": str(exc)
+            })
+
+            # Preserve the extracted data and original text
+            # even when translation fails.
+            translated_invoices.append({
+                **invoice,
+                "original_text": original_text,
+                "translated_text": original_text,
+                "source_language": "unknown",
+                "translation_confidence": None,
+                "translation_notes": (
+                    "Translation failed; original text preserved."
+                ),
+                "translation_cache_hit": False,
+                "translation_status": "failed",
+                "translation_error": str(exc)
+            })
+
+    return {
+        "translated_invoices": translated_invoices,
+        "translation_errors": translation_errors
+    }
+
+
+# ---------------------------------------------------------
+# Build LangGraph workflow
+# ---------------------------------------------------------
+
+def build_translation_graph():
+    """
+    Build and compile the translation workflow.
+    """
+    workflow = StateGraph(TranslationState)
+
+    workflow.add_node(
+        "translate_invoices",
+        translate_invoices
+    )
+
+    workflow.add_edge(START, "translate_invoices")
+    workflow.add_edge("translate_invoices", END)
+
+    return workflow.compile()
+
+
+translation_graph = build_translation_graph()
+
+
+# ---------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------
+
+def run_translation(
+    extracted_invoices: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """
+    Run translation on the extracted invoice records.
+
+    Example:
+        result = run_translation(extracted_invoices)
+        print(result["translated_invoices"])
+    """
+    initial_state: TranslationState = {
+        "extracted_invoices": extracted_invoices,
+        "translated_invoices": [],
+        "translation_errors": []
+    }
+
+    return translation_graph.invoke(initial_state)
+
+
+# ---------------------------------------------------------
+# Standalone smoke test
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    sample_invoice = {
+        "file_path": "sample_invoice.txt",
+        "raw_extracted_text": (
+            "Factura número: FAC-2026-001\n"
+            "Proveedor: Empresa Ejemplo\n"
+            "Fecha: 10/10/2026\n"
+            "Descripción: Servicios de consultoría\n"
+            "Cantidad: 2\n"
+            "Precio unitario: EUR 150.00\n"
+            "Total: EUR 300.00"
+        ),
+        "extracted_fields": {
+            "invoice_number": "FAC-2026-001"
+        }
+    }
+
+    result = run_translation([sample_invoice])
+
+    print(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2
+        )
+    )
+
+
+
+python -m backend.agents.translation_agent
+
+
+
+
+
+
+"""
+Reporting Agent - AI Invoice Auditor
+
+Responsibilities:
+1. Collect extraction, translation, and validation results.
+2. Identify missing fields and discrepancies.
+3. Recommend APPROVE, MANUAL_REVIEW, or REJECT.
+4. Generate JSON and HTML reports.
+5. Optionally persist audit results to PostgreSQL.
+6. Expose a LangGraph workflow.
+
+Expected input state keys:
+- extracted_invoices
+- translated_invoices
+- validation_results
+- business_validation_results
+
+The agent tolerates missing optional state keys so it can be
+tested independently and integrated incrementally.
+"""
+
+import html
+import json
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+REPORT_DIR = Path(
+    os.getenv("INVOICE_REPORT_DIR", str(BASE_DIR / "data" / "reports"))
+)
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------
+# LangGraph state
+# ---------------------------------------------------------
+
+class ReportingState(TypedDict, total=False):
+    extracted_invoices: list[dict[str, Any]]
+    translated_invoices: list[dict[str, Any]]
+    validation_results: list[dict[str, Any]]
+    business_validation_results: list[dict[str, Any]]
+
+    # Alternative input names supported for integration.
+    invoices: list[dict[str, Any]]
+    validation_reports: list[dict[str, Any]]
+    business_validation: list[dict[str, Any]]
+
+    reports: list[dict[str, Any]]
+    reporting_errors: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------
+
+def safe_filename(value: Any) -> str:
+    """Convert a value into a safe filename component."""
+    name = str(value or "invoice")
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    return name.strip("._") or "invoice"
+
+
+def first_value(
+    *values: Any,
+    default: Any = None
+) -> Any:
+    """Return the first non-empty value."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def as_list(value: Any) -> list[Any]:
+    """Normalize optional state values to a list."""
+    return value if isinstance(value, list) else []
+
+
+def json_safe(value: Any) -> Any:
+    """Convert common Python values to JSON-compatible values."""
+    if isinstance(value, dict):
+        return {
+            str(key): json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+
+def normalize_records(records: list[Any]) -> list[dict[str, Any]]:
+    """Keep dictionary records and ignore malformed entries."""
+    return [record for record in records if isinstance(record, dict)]
+
+
+def invoice_identifier(invoice: dict[str, Any]) -> str:
+    """Get a stable human-readable invoice identifier."""
+    fields = invoice.get("extracted_fields", {})
+
+    if not isinstance(fields, dict):
+        fields = {}
+
+    return str(
+        first_value(
+            invoice.get("invoice_number"),
+            fields.get("invoice_number"),
+            invoice.get("file_path"),
+            invoice.get("source_file"),
+            invoice.get("filename"),
+            default="unknown_invoice"
+        )
+    )
+
+
+def invoice_file_path(invoice: dict[str, Any]) -> str:
+    """Get the source file path when available."""
+    return str(
+        first_value(
+            invoice.get("file_path"),
+            invoice.get("source_file"),
+            invoice.get("filename"),
+            default=""
+        )
+    )
+
+
+def collect_missing_fields(invoice: dict[str, Any]) -> list[str]:
+    """Collect missing fields from extraction output."""
+    missing = invoice.get("missing_fields", [])
+
+    if isinstance(missing, list):
+        result = [str(item) for item in missing]
+    else:
+        result = []
+
+    fields = invoice.get("extracted_fields", {})
+
+    if not isinstance(fields, dict):
+        fields = {}
+
+    required_fields = (
+        "invoice_number",
+        "invoice_date",
+        "vendor_name",
+        "currency",
+        "total_amount"
+    )
+
+    for field in required_fields:
+        value = fields.get(field, invoice.get(field))
+
+        if value is None or str(value).strip() == "":
+            if field not in result:
+                result.append(field)
+
+    return result
+
+
+# ---------------------------------------------------------
+# Find validation and business-validation records
+# ---------------------------------------------------------
+
+def find_related_record(
+    invoice: dict[str, Any],
+    records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """
+    Match a result to an invoice using file path or invoice number.
+    Returns an empty dictionary when no match is found.
+    """
+    target_path = invoice_file_path(invoice)
+    target_id = invoice_identifier(invoice)
+
+    for record in records:
+        record_path = invoice_file_path(record)
+
+        record_fields = record.get("extracted_fields", {})
+        if not isinstance(record_fields, dict):
+            record_fields = {}
+
+        record_id = str(
+            first_value(
+                record.get("invoice_number"),
+                record_fields.get("invoice_number"),
+                record.get("invoice_id"),
+                record_path,
+                record.get("filename"),
+                default=""
+            )
+        )
+
+        if target_path and record_path and target_path == record_path:
+            return record
+
+        if target_id != "unknown_invoice" and record_id == target_id:
+            return record
+
+    return {}
+
+
+def collect_discrepancies(
+    validation: dict[str, Any],
+    business_validation: dict[str, Any]
+) -> list[Any]:
+    """Collect discrepancy information from validation results."""
+    discrepancies: list[Any] = []
+
+    for source in (validation, business_validation):
+        for key in (
+            "discrepancies",
+            "issues",
+            "errors",
+            "warnings"
+        ):
+            value = source.get(key)
+
+            if isinstance(value, list):
+                for item in value:
+                    if item not in discrepancies:
+                        discrepancies.append(item)
+
+            elif isinstance(value, str) and value.strip():
+                if value not in discrepancies:
+                    discrepancies.append(value)
+
+    return discrepancies
+
+
+def validation_passed(record: dict[str, Any]) -> bool | None:
+    """Interpret common validation result formats."""
+    for key in ("passed", "is_valid", "validation_passed"):
+        value = record.get(key)
+        if isinstance(value, bool):
+            return value
+
+    status = str(record.get("status", "")).lower()
+
+    if status in ("passed", "pass", "valid", "success", "approved"):
+        return True
+
+    if status in ("failed", "fail", "invalid", "error", "rejected"):
+        return False
+
+    return None
+
+
+# ---------------------------------------------------------
+# Recommendation logic
+# ---------------------------------------------------------
+
+def determine_recommendation(
+    invoice: dict[str, Any],
+    validation: dict[str, Any],
+    business_validation: dict[str, Any],
+    discrepancies: list[Any],
+    missing_fields: list[str]
+) -> tuple[str, list[str]]:
+    """
+    Make a conservative recommendation based on explicit
+    validation results.
+
+    A language model is not used to override deterministic
+    validation failures.
+    """
+    reasons: list[str] = []
+
+    extraction_status = str(
+        invoice.get("extraction_status", "")
+    ).lower()
+
+    translation_status = str(
+        invoice.get("translation_status", "")
+    ).lower()
+
+    validation_status = validation_passed(validation)
+    business_status = validation_passed(business_validation)
+
+    if extraction_status in ("failed", "error"):
+        reasons.append("Invoice extraction failed.")
+        return "MANUAL_REVIEW", reasons
+
+    if translation_status in ("failed", "error"):
+        reasons.append(
+            "Translation failed; the original text was preserved."
+        )
+        return "MANUAL_REVIEW", reasons
+
+    if missing_fields:
+        reasons.append(
+            "Required invoice fields are missing: "
+            + ", ".join(missing_fields)
+        )
+
+    if validation_status is False:
+        reasons.append("Invoice validation reported a failure.")
+
+    if business_status is False:
+        reasons.append("Business or ERP validation reported a failure.")
+
+    if discrepancies:
+        reasons.append(
+            f"{len(discrepancies)} discrepancy or issue item(s) were reported."
+        )
+
+    # Do not automatically reject invoices solely because a
+    # validation issue exists. Manual review is safer unless
+    # an upstream rule explicitly identifies a rejection.
+    explicit_rejection = any(
+        str(record.get("recommendation", "")).upper() == "REJECT"
+        or str(record.get("decision", "")).upper() == "REJECT"
+        for record in (validation, business_validation)
+    )
+
+    if explicit_rejection:
+        reasons.append(
+            "An upstream validation component explicitly recommended rejection."
+        )
+        return "REJECT", reasons
+
+    if (
+        missing_fields
+        or discrepancies
+        or validation_status is False
+        or business_status is False
+        or validation_status is None
+        or business_status is None
+    ):
+        if validation_status is None:
+            reasons.append(
+                "No conclusive validation status was supplied."
+            )
+
+        if business_status is None:
+            reasons.append(
+                "No conclusive business-validation status was supplied."
+            )
+
+        return "MANUAL_REVIEW", reasons
+
+    reasons.append(
+        "Required fields are present and both validation stages passed."
+    )
+
+    return "APPROVE", reasons
+
+
+# ---------------------------------------------------------
+# Report construction
+# ---------------------------------------------------------
+
+def build_invoice_report(
+    invoice: dict[str, Any],
+    translated_invoice: dict[str, Any],
+    validation: dict[str, Any],
+    business_validation: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a complete structured report for one invoice."""
+    fields = invoice.get("extracted_fields", {})
+
+    if not isinstance(fields, dict):
+        fields = {}
+
+    translated_fields = translated_invoice.get("extracted_fields", {})
+
+    if not isinstance(translated_fields, dict):
+        translated_fields = {}
+
+    merged_fields = {**fields, **translated_fields}
+
+    missing_fields = collect_missing_fields({
+        **invoice,
+        "extracted_fields": merged_fields
+    })
+
+    discrepancies = collect_discrepancies(
+        validation,
+        business_validation
+    )
+
+    recommendation, reasons = determine_recommendation(
+        invoice=invoice,
+        validation=validation,
+        business_validation=business_validation,
+        discrepancies=discrepancies,
+        missing_fields=missing_fields
+    )
+
+    report = {
+        "report_id": (
+            f"{safe_filename(invoice_identifier(invoice))}_"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+        ),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "invoice_id": invoice_identifier(invoice),
+        "file_path": invoice_file_path(invoice),
+        "extraction_status": invoice.get(
+            "extraction_status",
+            "unknown"
+        ),
+        "extracted_fields": json_safe(merged_fields),
+        "raw_extracted_text": first_value(
+            invoice.get("raw_extracted_text"),
+            invoice.get("raw_text"),
+            ""
+        ),
+        "translation": {
+            "status": translated_invoice.get(
+                "translation_status",
+                "not_run"
+            ),
+            "source_language": translated_invoice.get(
+                "source_language",
+                "unknown"
+            ),
+            "translated_text": translated_invoice.get(
+                "translated_text",
+                ""
+            ),
+            "translation_confidence": translated_invoice.get(
+                "translation_confidence"
+            ),
+            "translation_notes": translated_invoice.get(
+                "translation_notes",
+                ""
+            ),
+            "cache_hit": translated_invoice.get(
+                "translation_cache_hit",
+                False
+            )
+        },
+        "validation": json_safe(validation),
+        "business_validation": json_safe(business_validation),
+        "missing_fields": missing_fields,
+        "discrepancies": json_safe(discrepancies),
+        "recommendation": recommendation,
+        "recommendation_reasons": reasons
+    }
+
+    return json_safe(report)
+
+
+# ---------------------------------------------------------
+# JSON report output
+# ---------------------------------------------------------
+
+def write_json_report(report: dict[str, Any]) -> str:
+    """Write a report to a uniquely named JSON file."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{safe_filename(report.get('report_id'))}.json"
+    output_path = REPORT_DIR / filename
+
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            report,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    return str(output_path)
+
+
+# ---------------------------------------------------------
+# HTML report output
+# ---------------------------------------------------------
+
+def html_escape(value: Any) -> str:
+    """Escape values before inserting them into HTML."""
+    if value is None:
+        return ""
+
+    if isinstance(value, (dict, list)):
+        value = json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    return html.escape(str(value))
+
+
+def render_html_report(report: dict[str, Any]) -> str:
+    """Render a self-contained HTML audit report."""
+    recommendation = str(
+        report.get("recommendation", "MANUAL_REVIEW")
+    )
+
+    fields_json = json.dumps(
+        report.get("extracted_fields", {}),
+        ensure_ascii=False,
+        indent=2
+    )
+
+    validation_json = json.dumps(
+        report.get("validation", {}),
+        ensure_ascii=False,
+        indent=2
+    )
+
+    business_json = json.dumps(
+        report.get("business_validation", {}),
+        ensure_ascii=False,
+        indent=2
+    )
+
+    translation = report.get("translation", {})
+    if not isinstance(translation, dict):
+        translation = {}
+
+    discrepancies = report.get("discrepancies", [])
+    missing_fields = report.get("missing_fields", [])
+    reasons = report.get("recommendation_reasons", [])
+
+    discrepancy_items = "".join(
+        f"<li>{html_escape(item)}</li>"
+        for item in discrepancies
+    ) or "<li>No discrepancies were reported.</li>"
+
+    missing_items = "".join(
+        f"<li>{html_escape(item)}</li>"
+        for item in missing_fields
+    ) or "<li>No missing required fields were detected.</li>"
+
+    reason_items = "".join(
+        f"<li>{html_escape(item)}</li>"
+        for item in reasons
+    ) or "<li>No recommendation reasons were recorded.</li>"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invoice Audit Report - {html_escape(report.get('invoice_id'))}</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    max-width: 1100px;
+    margin: 32px auto;
+    padding: 0 20px;
+    color: #202124;
+    line-height: 1.5;
+}}
+h1, h2 {{ color: #1f2937; }}
+section {{
+    border: 1px solid #d8dee8;
+    border-radius: 8px;
+    padding: 18px;
+    margin: 18px 0;
+}}
+pre {{
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: #f5f7fa;
+    padding: 14px;
+    border-radius: 6px;
+}}
+.recommendation {{
+    padding: 12px;
+    border: 1px solid #9ca3af;
+    border-radius: 6px;
+    font-weight: bold;
+}}
+small {{ color: #5f6368; }}
+</style>
+</head>
+<body>
+<h1>AI Invoice Auditor Report</h1>
+
+<section>
+<h2>Summary</h2>
+<p><strong>Invoice:</strong> {html_escape(report.get('invoice_id'))}</p>
+<p><strong>Source file:</strong> {html_escape(report.get('file_path'))}</p>
+<p><strong>Generated at:</strong> {html_escape(report.get('generated_at'))}</p>
+<p><strong>Extraction status:</strong> {html_escape(report.get('extraction_status'))}</p>
+<p class="recommendation">
+Recommendation: {html_escape(recommendation)}
+</p>
+<ul>{reason_items}</ul>
+</section>
+
+<section>
+<h2>Extracted Invoice Fields</h2>
+<pre>{html_escape(fields_json)}</pre>
+</section>
+
+<section>
+<h2>Translation</h2>
+<p><strong>Status:</strong> {html_escape(translation.get('status'))}</p>
+<p><strong>Source language:</strong> {html_escape(translation.get('source_language'))}</p>
+<p><strong>Confidence estimate:</strong> {html_escape(translation.get('translation_confidence'))}</p>
+<p><strong>Notes:</strong> {html_escape(translation.get('translation_notes'))}</p>
+<h3>English text</h3>
+<pre>{html_escape(translation.get('translated_text'))}</pre>
+</section>
+
+<section>
+<h2>Missing Fields</h2>
+<ul>{missing_items}</ul>
+</section>
+
+<section>
+<h2>Discrepancies and Issues</h2>
+<ul>{discrepancy_items}</ul>
+</section>
+
+<section>
+<h2>Validation Results</h2>
+<pre>{html_escape(validation_json)}</pre>
+</section>
+
+<section>
+<h2>Business / ERP Validation Results</h2>
+<pre>{html_escape(business_json)}</pre>
+</section>
+
+<footer>
+<small>Automated recommendation only. Review the underlying
+invoice and validation evidence before making a financial decision.</small>
+</footer>
+</body>
+</html>
+"""
+
+
+def write_html_report(report: dict[str, Any]) -> str:
+    """Write an HTML report to disk."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{safe_filename(report.get('report_id'))}.html"
+    output_path = REPORT_DIR / filename
+
+    html_content = render_html_report(report)
+
+    with output_path.open("w", encoding="utf-8") as file:
+        file.write(html_content)
+
+    return str(output_path)
+
+
+# ---------------------------------------------------------
+# Optional PostgreSQL persistence
+# ---------------------------------------------------------
+
+def persist_report(report: dict[str, Any]) -> None:
+    """
+    Persist an audit report to PostgreSQL when DATABASE_URL
+    is configured.
+
+    Expected table:
+        audit.invoice_audit
+
+    Required columns:
+        report_id TEXT PRIMARY KEY
+        invoice_id TEXT
+        file_path TEXT
+        recommendation TEXT
+        report_json JSONB
+        created_at TIMESTAMPTZ
+
+    This function does not create or migrate database tables.
+    """
+    if not DATABASE_URL:
+        logger.info(
+            "DATABASE_URL is not configured; report remains on disk."
+        )
+        return
+
+    try:
+        import psycopg
+        from psycopg.types.json import Jsonb
+
+    except ImportError as exc:
+        raise RuntimeError(
+            "PostgreSQL persistence is enabled, but psycopg is missing. "
+            "Install it using: python -m pip install 'psycopg[binary]'"
+        ) from exc
+
+    sql = """
+        INSERT INTO audit.invoice_audit
+            (
+                report_id,
+                invoice_id,
+                file_path,
+                recommendation,
+                report_json,
+                created_at
+            )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (report_id)
+        DO UPDATE SET
+            invoice_id = EXCLUDED.invoice_id,
+            file_path = EXCLUDED.file_path,
+            recommendation = EXCLUDED.recommendation,
+            report_json = EXCLUDED.report_json,
+            created_at = EXCLUDED.created_at
+    """
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql,
+                (
+                    report["report_id"],
+                    report.get("invoice_id"),
+                    report.get("file_path"),
+                    report.get("recommendation"),
+                    Jsonb(report),
+                    datetime.now(timezone.utc)
+                )
+            )
+
+
+# ---------------------------------------------------------
+# Reporting LangGraph node
+# ---------------------------------------------------------
+
+def generate_reports(
+    state: ReportingState
+) -> dict[str, Any]:
+    """Generate JSON and HTML reports for the supplied invoices."""
+    extracted = normalize_records(
+        as_list(state.get("extracted_invoices"))
+        or as_list(state.get("invoices"))
+    )
+
+    translated = normalize_records(
+        as_list(state.get("translated_invoices"))
+    )
+
+    validation_records = normalize_records(
+        as_list(state.get("validation_results"))
+        or as_list(state.get("validation_reports"))
+    )
+
+    business_records = normalize_records(
+        as_list(state.get("business_validation_results"))
+        or as_list(state.get("business_validation"))
+    )
+
+    # If only translated invoices are supplied, use them as
+    # the invoice source too.
+    if not extracted and translated:
+        extracted = translated
+
+    reports: list[dict[str, Any]] = []
+    reporting_errors: list[dict[str, Any]] = []
+
+    for invoice in extracted:
+        file_path = invoice_file_path(invoice)
+
+        try:
+            translated_invoice = find_related_record(
+                invoice,
+                translated
+            )
+
+            # If the translation result is the same invoice
+            # record, this also works for merged pipeline states.
+            if not translated_invoice and (
+                "translated_text" in invoice
+                or "translation_status" in invoice
+            ):
+                translated_invoice = invoice
+
+            validation = find_related_record(
+                invoice,
+                validation_records
+            )
+
+            business_validation = find_related_record(
+                invoice,
+                business_records
+            )
+
+            report = build_invoice_report(
+                invoice=invoice,
+                translated_invoice=translated_invoice,
+                validation=validation,
+                business_validation=business_validation
+            )
+
+            report["json_report_path"] = write_json_report(report)
+            report["html_report_path"] = write_html_report(report)
+
+            # Database failure is recorded separately. The JSON
+            # and HTML reports have already been written.
+            try:
+                persist_report(report)
+                report["database_persisted"] = bool(DATABASE_URL)
+
+            except Exception as db_exc:
+                logger.exception(
+                    "Could not persist report for %s",
+                    file_path
+                )
+
+                report["database_persisted"] = False
+                report["database_error"] = str(db_exc)
+
+                reporting_errors.append({
+                    "file_path": file_path,
+                    "stage": "database_persistence",
+                    "error": str(db_exc)
+                })
+
+            reports.append(report)
+
+        except Exception as exc:
+            logger.exception(
+                "Report generation failed for %s",
+                file_path
+            )
+
+            reporting_errors.append({
+                "file_path": file_path,
+                "stage": "report_generation",
+                "error": str(exc)
+            })
+
+    return {
+        "reports": reports,
+        "reporting_errors": reporting_errors
+    }
+
+
+# ---------------------------------------------------------
+# Build graph
+# ---------------------------------------------------------
+
+def build_reporting_graph():
+    """Create and compile the reporting workflow."""
+    workflow = StateGraph(ReportingState)
+
+    workflow.add_node("generate_reports", generate_reports)
+
+    workflow.add_edge(START, "generate_reports")
+    workflow.add_edge("generate_reports", END)
+
+    return workflow.compile()
+
+
+reporting_graph = build_reporting_graph()
+
+
+# ---------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------
+
+def run_reporting(
+    extracted_invoices: list[dict[str, Any]],
+    translated_invoices: list[dict[str, Any]] | None = None,
+    validation_results: list[dict[str, Any]] | None = None,
+    business_validation_results: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Run report generation and return reports plus errors."""
+    state: ReportingState = {
+        "extracted_invoices": extracted_invoices,
+        "translated_invoices": translated_invoices or [],
+        "validation_results": validation_results or [],
+        "business_validation_results": (
+            business_validation_results or []
+        )
+    }
+
+    return reporting_graph.invoke(state)
+
+
+# ---------------------------------------------------------
+# Standalone test
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    sample_invoice = {
+        "file_path": "backend/data/incoming/sample_invoice.pdf",
+        "extraction_status": "success",
+        "extracted_fields": {
+            "invoice_number": "INV-2026-001",
+            "invoice_date": "2026-10-10",
+            "vendor_name": "Example Supplier",
+            "currency": "USD",
+            "total_amount": 300.00
+        },
+        "raw_extracted_text": (
+            "Invoice Number: INV-2026-001\n"
+            "Vendor: Example Supplier\n"
+            "Total: USD 300.00"
+        )
+    }
+
+    sample_translation = {
+        **sample_invoice,
+        "source_language": "English",
+        "translated_text": sample_invoice["raw_extracted_text"],
+        "translation_confidence": 0.99,
+        "translation_status": "success",
+        "translation_notes": ""
+    }
+
+    # A manual-review result is expected unless BOTH validation
+    # stages report a passing status.
+    sample_validation = {
+        "file_path": sample_invoice["file_path"],
+        "status": "passed",
+        "passed": True,
+        "discrepancies": [],
+        "missing_fields": []
+    }
+
+    sample_business_validation = {
+        "file_path": sample_invoice["file_path"],
+        "status": "passed",
+        "passed": True,
+        "discrepancies": []
+    }
+
+    result = run_reporting(
+        extracted_invoices=[sample_invoice],
+        translated_invoices=[sample_translation],
+        validation_results=[sample_validation],
+        business_validation_results=[sample_business_validation]
+    )
+
+    print(
+        json.dumps(
+            json_safe(result),
+            ensure_ascii=False,
+            indent=2
+        )
+    )
+
+
+
+
+
+
+"""Main LangGraph workflow for the AI Invoice Auditor.
+
+Pipeline:
+monitor -> extract -> translate -> validate -> business_validate -> report
+
+The workflow isolates agent failures so that the run can produce a summary
+and, where possible, reports for invoices that were processed successfully.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from backend.agents import (
+    invoice_monitor_agent,
+    extractor_agent,
+    translation_agent,
+    validation_agent,
+    business_validation_agent,
+    reporting_agent,
+)
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_INCOMING_DIR = PROJECT_DIR / "data" / "incoming"
+
+
+class InvoiceWorkflowState(TypedDict, total=False):
+    """Shared state passed between the six agents."""
+
+    # Run configuration
+    incoming_dir: str
+    run_id: str
+    started_at: str
+
+    # Monitor
+    discovered_files: list[dict[str, Any]]
+    new_invoices: list[dict[str, Any]]
+    skipped_invoices: list[dict[str, Any]]
+
+    # Pipeline data
+    extracted_invoices: list[dict[str, Any]]
+    translated_invoices: list[dict[str, Any]]
+    validation_results: list[dict[str, Any]]
+    business_validation_results: list[dict[str, Any]]
+    reports: list[dict[str, Any]]
+
+    # Diagnostics and final status
+    errors: list[dict[str, Any]]
+    agent_status: dict[str, str]
+    current_stage: str
+    workflow_status: str
+    summary: dict[str, Any]
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Normalize an agent result to a dictionary."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        return {"items": value}
+    return {"result": value}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Return a list without splitting strings or dictionaries."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _append_error(
+    state: InvoiceWorkflowState,
+    agent: str,
+    exc: Exception,
+) -> list[dict[str, Any]]:
+    """Return an updated error list without mutating the existing state."""
+    errors = list(state.get("errors", []))
+    error_record = {
+        "agent": agent,
+        "stage": agent,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    errors.append(error_record)
+    logger.exception("Agent '%s' failed: %s", agent, exc)
+    return errors
+
+
+def _status_update(
+    state: InvoiceWorkflowState,
+    agent: str,
+    status: str,
+) -> dict[str, str]:
+    statuses = dict(state.get("agent_status", {}))
+    statuses[agent] = status
+    return statuses
+
+
+def _resolve_runner(module: Any, candidates: tuple[str, ...]):
+    """Find an agent's public runner using common naming conventions."""
+    for name in candidates:
+        runner = getattr(module, name, None)
+        if callable(runner):
+            return runner
+
+    available = [
+        name for name in dir(module)
+        if name.startswith("run_") and callable(getattr(module, name))
+    ]
+    raise AttributeError(
+        f"No supported runner found in {module.__name__}. "
+        f"Tried {candidates}. Available runners: {available}"
+    )
+
+
+def _call_runner(
+    module: Any,
+    candidates: tuple[str, ...],
+    payload: dict[str, Any],
+    primary_input: Any = None,
+) -> dict[str, Any]:
+    """Call an agent runner while adapting common state/argument signatures.
+
+    Supported patterns include:
+      run_agent(state)
+      run_agent(invoices)
+      run_agent(extracted_invoices=...)
+      run_agent(**state)
+
+    This adapter avoids retrying a function after it has started executing,
+    which could otherwise repeat side effects.
+    """
+    runner = _resolve_runner(module, candidates)
+
+    try:
+        signature = inspect.signature(runner)
+    except (TypeError, ValueError):
+        result = runner(payload)
+        return _as_dict(result)
+
+    parameters = list(signature.parameters.values())
+
+    if not parameters:
+        return _as_dict(runner())
+
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters):
+        return _as_dict(runner(**payload))
+
+    # A single state-like parameter receives the complete workflow state.
+    if len(parameters) == 1:
+        parameter = parameters[0]
+        if parameter.name in {
+            "state", "workflow_state", "input_state", "inputs", "data"
+        }:
+            return _as_dict(runner(payload))
+
+        # If the single parameter matches a payload key, pass that value.
+        if parameter.name in payload:
+            return _as_dict(runner(payload[parameter.name]))
+
+        # For an agent with a differently named single input, use the
+        # node-specific primary input (for example, a list of invoices).
+        if primary_input is not None:
+            return _as_dict(runner(primary_input))
+
+        if parameter.default is not inspect.Parameter.empty:
+            return _as_dict(runner())
+
+        return _as_dict(runner(payload))
+
+    kwargs: dict[str, Any] = {}
+    missing_required: list[str] = []
+
+    for parameter in parameters:
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
+        if parameter.name in payload:
+            kwargs[parameter.name] = payload[parameter.name]
+        elif parameter.default is inspect.Parameter.empty:
+            missing_required.append(parameter.name)
+
+    if not missing_required:
+        return _as_dict(runner(**kwargs))
+
+    # Some agents use a different name for their first required input.
+    # Use the primary input only when there is exactly one required
+    # positional parameter and no other required parameters.
+    required_positional = [
+        p for p in parameters
+        if p.default is inspect.Parameter.empty
+        and p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+
+    if primary_input is not None and len(required_positional) == 1:
+        parameter = required_positional[0]
+        kwargs.pop(parameter.name, None)
+        return _as_dict(runner(primary_input, **kwargs))
+
+    raise TypeError(
+        f"Cannot map inputs to {module.__name__}.{runner.__name__}. "
+        f"Missing required parameters: {missing_required}. "
+        f"Available payload keys: {sorted(payload.keys())}"
+    )
+
+
+def _records_from(
+    result: dict[str, Any],
+    *candidate_keys: str,
+) -> list[dict[str, Any]]:
+    """Find a list of records under any supported output key."""
+    for key in candidate_keys:
+        if key in result and result[key] is not None:
+            records = _as_list(result[key])
+            return [item for item in records if isinstance(item, dict)]
+
+    # Allow agents to return {"items": [...]}.
+    if "items" in result:
+        return [
+            item for item in _as_list(result["items"])
+            if isinstance(item, dict)
+        ]
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Node 1: Invoice Monitor
+# ---------------------------------------------------------------------------
+
+def monitor_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Starting invoice monitor")
+    try:
+        incoming_dir = state.get(
+            "incoming_dir", str(DEFAULT_INCOMING_DIR)
+        )
+
+        result = _call_runner(
+            invoice_monitor_agent,
+            ("run_invoice_monitor", "run_monitor", "run_agent"),
+            {
+                **state,
+                "incoming_dir": incoming_dir,
+            },
+            primary_input={"incoming_dir": incoming_dir},
+        )
+
+        new_invoices = _records_from(
+            result, "new_invoices", "invoices_to_process"
+        )
+        discovered = _records_from(
+            result, "discovered_files", "files", "detected_files"
+        )
+        skipped = _records_from(
+            result, "skipped_invoices", "duplicates", "skipped_files"
+        )
+
+        # Some monitor implementations use a different output key.
+        if not new_invoices and "new_invoices" not in result:
+            new_invoices = _records_from(result, "items")
+
+        return {
+            "discovered_files": discovered,
+            "new_invoices": new_invoices,
+            "skipped_invoices": skipped,
+            "errors": list(state.get("errors", [])),
+            "agent_status": _status_update(state, "monitor", "success"),
+            "current_stage": "monitor_complete",
+        }
+
+    except Exception as exc:
+        return {
+            "discovered_files": list(state.get("discovered_files", [])),
+            "new_invoices": [],
+            "errors": _append_error(state, "monitor", exc),
+            "agent_status": _status_update(state, "monitor", "failed"),
+            "current_stage": "monitor_failed",
+        }
+
+
+def route_after_monitor(state: InvoiceWorkflowState) -> str:
+    """Do not run downstream agents if no new invoices were found."""
+    if state.get("agent_status", {}).get("monitor") == "failed":
+        return "report"
+
+    if state.get("new_invoices"):
+        return "extract"
+
+    return "report"
+
+
+# ---------------------------------------------------------------------------
+# Node 2: Extraction
+# ---------------------------------------------------------------------------
+
+def extraction_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Starting extraction for %d file(s)", len(state.get("new_invoices", [])))
+    try:
+        files = state.get("new_invoices", [])
+        result = _call_runner(
+            extractor_agent,
+            ("run_extractor", "run_extraction", "run_agent"),
+            {
+                **state,
+                "new_invoices": files,
+                "invoices": files,
+                "files": files,
+            },
+            primary_input=files,
+        )
+
+        extracted = _records_from(
+            result, "extracted_invoices", "invoices", "extractions"
+        )
+
+        # If an agent returns one invoice record directly, retain it.
+        if not extracted and (
+            "extracted_fields" in result or "raw_extracted_text" in result
+        ):
+            extracted = [result]
+
+        return {
+            "extracted_invoices": extracted,
+            "errors": list(state.get("errors", [])),
+            "agent_status": _status_update(state, "extractor", "success"),
+            "current_stage": "extraction_complete",
+        }
+
+    except Exception as exc:
+        return {
+            "extracted_invoices": [],
+            "errors": _append_error(state, "extractor", exc),
+            "agent_status": _status_update(state, "extractor", "failed"),
+            "current_stage": "extraction_failed",
+        }
+
+
+def route_after_extraction(state: InvoiceWorkflowState) -> str:
+    if state.get("extracted_invoices"):
+        return "translate"
+    return "report"
+
+
+# ---------------------------------------------------------------------------
+# Node 3: Translation
+# ---------------------------------------------------------------------------
+
+def translation_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Starting translation")
+    try:
+        invoices = state.get("extracted_invoices", [])
+        result = _call_runner(
+            translation_agent,
+            ("run_translation", "run_translation_agent", "run_agent"),
+            {
+                **state,
+                "extracted_invoices": invoices,
+                "invoices": invoices,
+            },
+            primary_input=invoices,
+        )
+
+        translated = _records_from(
+            result, "translated_invoices", "invoices", "translations"
+        )
+
+        # If the translation agent returns no separate output list, preserve
+        # extracted records rather than losing invoices from the workflow.
+        if not translated:
+            translated = invoices
+
+        translation_errors = _as_list(result.get("translation_errors", []))
+        new_errors = list(state.get("errors", []))
+        for error in translation_errors:
+            new_errors.append({
+                "agent": "translation",
+                "stage": "translation",
+                "message": str(error),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        return {
+            "translated_invoices": translated,
+            "errors": new_errors,
+            "agent_status": _status_update(state, "translation", "success"),
+            "current_stage": "translation_complete",
+        }
+
+    except Exception as exc:
+        # Translation is important, but a failed translation should not
+        # discard extracted evidence. Pass it onward for manual review.
+        return {
+            "translated_invoices": list(state.get("extracted_invoices", [])),
+            "errors": _append_error(state, "translation", exc),
+            "agent_status": _status_update(state, "translation", "failed"),
+            "current_stage": "translation_failed",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Node 4: Invoice data validation
+# ---------------------------------------------------------------------------
+
+def validation_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Starting invoice data validation")
+    try:
+        invoices = state.get("translated_invoices", [])
+        result = _call_runner(
+            validation_agent,
+            (
+                "run_validation",
+                "run_validation_agent",
+                "run_invoice_validation",
+                "run_agent",
+            ),
+            {
+                **state,
+                "translated_invoices": invoices,
+                "extracted_invoices": state.get("extracted_invoices", []),
+                "invoices": invoices,
+            },
+            primary_input=invoices,
+        )
+
+        validations = _records_from(
+            result,
+            "validation_results",
+            "validation_reports",
+            "validation_reports_list",
+            "results",
+            "invoices",
+        )
+
+        return {
+            "validation_results": validations,
+            "errors": list(state.get("errors", [])),
+            "agent_status": _status_update(state, "validation", "success"),
+            "current_stage": "validation_complete",
+        }
+
+    except Exception as exc:
+        return {
+            "validation_results": [],
+            "errors": _append_error(state, "validation", exc),
+            "agent_status": _status_update(state, "validation", "failed"),
+            "current_stage": "validation_failed",
+        }
+
+
+def route_after_validation(state: InvoiceWorkflowState) -> str:
+    # Run business validation even when internal validation flags issues:
+    # ERP evidence can help the reviewer understand the discrepancy.
+    if state.get("translated_invoices"):
+        return "business_validate"
+    return "report"
+
+
+# ---------------------------------------------------------------------------
+# Node 5: ERP/business validation
+# ---------------------------------------------------------------------------
+
+def business_validation_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Starting business/ERP validation")
+    try:
+        invoices = state.get("translated_invoices", [])
+        validations = state.get("validation_results", [])
+
+        result = _call_runner(
+            business_validation_agent,
+            (
+                "run_business_validation",
+                "run_business_validation_agent",
+                "run_erp_validation",
+                "run_agent",
+            ),
+            {
+                **state,
+                "translated_invoices": invoices,
+                "invoices": invoices,
+                "validation_results": validations,
+                "validation_reports": validations,
+            },
+            primary_input=invoices,
+        )
+
+        business_results = _records_from(
+            result,
+            "business_validation_results",
+            "business_validation",
+            "erp_validation_results",
+            "validation_results",
+            "results",
+            "invoices",
+        )
+
+        return {
+            "business_validation_results": business_results,
+            "errors": list(state.get("errors", [])),
+            "agent_status": _status_update(
+                state, "business_validation", "success"
+            ),
+            "current_stage": "business_validation_complete",
+        }
+
+    except Exception as exc:
+        return {
+            "business_validation_results": [],
+            "errors": _append_error(state, "business_validation", exc),
+            "agent_status": _status_update(
+                state, "business_validation", "failed"
+            ),
+            "current_stage": "business_validation_failed",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Node 6: Reporting
+# ---------------------------------------------------------------------------
+
+def reporting_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    logger.info("Generating invoice audit reports")
+    try:
+        result = _call_runner(
+            reporting_agent,
+            ("run_reporting", "run_reporting_agent", "run_agent"),
+            {
+                **state,
+                "extracted_invoices": state.get("extracted_invoices", []),
+                "translated_invoices": state.get("translated_invoices", []),
+                "validation_results": state.get("validation_results", []),
+                "business_validation_results": state.get(
+                    "business_validation_results", []
+                ),
+            },
+            primary_input={
+                "extracted_invoices": state.get("extracted_invoices", []),
+                "translated_invoices": state.get("translated_invoices", []),
+                "validation_results": state.get("validation_results", []),
+                "business_validation_results": state.get(
+                    "business_validation_results", []
+                ),
+            },
+        )
+
+        reports = _records_from(result, "reports", "generated_reports", "items")
+
+        # Some reporting agents return a single report directly.
+        if not reports and ("recommendation" in result or "report_id" in result):
+            reports = [result]
+
+        statuses = dict(state.get("agent_status", {}))
+        statuses["reporting"] = "success"
+
+        return {
+            "reports": reports,
+            "agent_status": statuses,
+            "current_stage": "reporting_complete",
+        }
+
+    except Exception as exc:
+        statuses = _status_update(state, "reporting", "failed")
+        return {
+            "reports": list(state.get("reports", [])),
+            "errors": _append_error(state, "reporting", exc),
+            "agent_status": statuses,
+            "current_stage": "reporting_failed",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Final status
+# ---------------------------------------------------------------------------
+
+def finalize_node(state: InvoiceWorkflowState) -> dict[str, Any]:
+    statuses = dict(state.get("agent_status", {}))
+    errors = list(state.get("errors", []))
+    reports = list(state.get("reports", []))
+    new_invoices = list(state.get("new_invoices", []))
+
+    failed_agents = [
+        agent for agent, status in statuses.items()
+        if status == "failed"
+    ]
+
+    if failed_agents:
+        workflow_status = "completed_with_errors"
+    elif not new_invoices:
+        workflow_status = "no_new_invoices"
+    else:
+        workflow_status = "completed"
+
+    summary = {
+        "run_id": state.get("run_id"),
+        "workflow_status": workflow_status,
+        "started_at": state.get("started_at"),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "discovered_count": len(state.get("discovered_files", [])),
+        "new_invoice_count": len(new_invoices),
+        "skipped_count": len(state.get("skipped_invoices", [])),
+        "extracted_count": len(state.get("extracted_invoices", [])),
+        "translated_count": len(state.get("translated_invoices", [])),
+        "validation_count": len(state.get("validation_results", [])),
+        "business_validation_count": len(
+            state.get("business_validation_results", [])
+        ),
+        "report_count": len(reports),
+        "error_count": len(errors),
+        "failed_agents": failed_agents,
+        "agent_status": statuses,
+    }
+
+    logger.info("Workflow summary: %s", summary)
+    return {
+        "summary": summary,
+        "workflow_status": workflow_status,
+        "current_stage": "finished",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build and compile the graph
+# ---------------------------------------------------------------------------
+
+def build_workflow():
+    graph = StateGraph(InvoiceWorkflowState)
+
+    graph.add_node("monitor", monitor_node)
+    graph.add_node("extract", extraction_node)
+    graph.add_node("translate", translation_node)
+    graph.add_node("validate", validation_node)
+    graph.add_node("business_validate", business_validation_node)
+    graph.add_node("report", reporting_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.add_edge(START, "monitor")
+
+    graph.add_conditional_edges(
+        "monitor",
+        route_after_monitor,
+        {
+            "extract": "extract",
+            "report": "report",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "extract",
+        route_after_extraction,
+        {
+            "translate": "translate",
+            "report": "report",
+        },
+    )
+
+    graph.add_edge("translate", "validate")
+
+    graph.add_conditional_edges(
+        "validate",
+        route_after_validation,
+        {
+            "business_validate": "business_validate",
+            "report": "report",
+        },
+    )
+
+    graph.add_edge("business_validate", "report")
+    graph.add_edge("report", "finalize")
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+workflow = build_workflow()
+
+
+def run_workflow(
+    incoming_dir: str | Path | None = None,
+    *,
+    run_id: str | None = None,
+) -> InvoiceWorkflowState:
+    """Run the complete invoice audit workflow."""
+    start_time = datetime.now(timezone.utc).isoformat()
+
+    initial_state: InvoiceWorkflowState = {
+        "incoming_dir": str(incoming_dir or DEFAULT_INCOMING_DIR),
+        "run_id": run_id or datetime.now(timezone.utc).strftime(
+            "invoice-audit-%Y%m%dT%H%M%S%fZ"
+        ),
+        "started_at": start_time,
+        "discovered_files": [],
+        "new_invoices": [],
+        "skipped_invoices": [],
+        "extracted_invoices": [],
+        "translated_invoices": [],
+        "validation_results": [],
+        "business_validation_results": [],
+        "reports": [],
+        "errors": [],
+        "agent_status": {},
+        "current_stage": "starting",
+        "workflow_status": "running",
+        "summary": {},
+    }
+
+    return workflow.invoke(initial_state)
+
+
+if __name__ == "__main__":
+    import json
+
+    result = run_workflow()
+    print(json.dumps(result.get("summary", {}), indent=2, default=str))
+
+    if result.get("errors"):
+        print("\nWorkflow errors:")
+        print(json.dumps(result["errors"], indent=2, default=str))
+
